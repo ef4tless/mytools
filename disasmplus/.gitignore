@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# IDA databases and temporary analysis state
+*.id0
+*.id1
+*.id2
+*.idb
+*.i64
+*.nam
+*.til
+
+# Generated reports and local verification output
+*.log
+*_kctf/
+*_kctf_*/
+*_kctf_flow/
+artifacts/
+output/
+samples/
