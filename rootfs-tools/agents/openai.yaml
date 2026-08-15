@@ -1,0 +1,4 @@
+interface:
+  display_name: "RootFS Tools"
+  short_description: "Unpack and repack CTF rootfs images"
+  default_prompt: "Use rootfs-tools to inspect, unpack, modify, or repack root filesystem images for kernel and pwn challenges."

@@ -1,0 +1,851 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_NAME=$(basename "$0")
+GDB_PORT=1234
+
+log() {
+    printf '[*] %s\n' "$*" >&2
+}
+
+die() {
+    printf '[!] %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  $TOOL_NAME open [--force] IMAGE
+  $TOOL_NAME pack IMAGE [EXP_SRC] [--restore-init] [--pristine]
+
+Main commands:
+  open   detect and unpack IMAGE into IMAGE-derived workdir
+  pack   optionally build exp, optionally restore /init, then repack
+
+Notes:
+  - workdir is created next to IMAGE, e.g. rootfs.cpio -> rootfs.work/
+  - supports cpio and {gz,xz,zst,lz4}+cpio, plus raw ext2/3/4 images
+  - pack auto-builds IMAGE directory's exp.c with default -O2 when it exists
+  - pack --pristine rebuilds from the original IMAGE and injects only exp
+  - normal pack generates a .gdb helper when vmlinux and *.ko are present
+
+Examples:
+  $TOOL_NAME open rootfs.cpio
+  $TOOL_NAME pack rootfs.cpio
+  $TOOL_NAME pack rootfs.cpio exp1.c
+  $TOOL_NAME pack rootfs.cpio --restore-init
+  $TOOL_NAME pack rootfs.cpio --pristine
+EOF
+}
+
+abs_existing_path() {
+    local path="$1"
+    local dir base
+
+    [[ -e "$path" ]] || die "path not found: $path"
+    dir=$(cd "$(dirname -- "$path")" && pwd -P)
+    base=$(basename -- "$path")
+    printf '%s/%s\n' "$dir" "$base"
+}
+
+image_stem_from_name() {
+    local name="$1"
+
+    case "$name" in
+        *.gz) name=${name%.gz} ;;
+        *.xz) name=${name%.xz} ;;
+        *.zst) name=${name%.zst} ;;
+        *.lz4) name=${name%.lz4} ;;
+    esac
+    case "$name" in
+        *.cpio) name=${name%.cpio} ;;
+        *.ext4) name=${name%.ext4} ;;
+        *.ext3) name=${name%.ext3} ;;
+        *.ext2) name=${name%.ext2} ;;
+        *.img) name=${name%.img} ;;
+    esac
+    printf '%s\n' "$name"
+}
+
+workdir_for_image() {
+    local image_abs="$1"
+    local image_dir image_name stem
+
+    image_dir=$(dirname -- "$image_abs")
+    image_name=$(basename -- "$image_abs")
+    stem=$(image_stem_from_name "$image_name")
+    printf '%s/%s.work\n' "$image_dir" "$stem"
+}
+
+state_file_for_workdir() {
+    printf '%s/meta/state.env\n' "$1"
+}
+
+init_context_from_image() {
+    local image_abs="$1"
+
+    IMAGE="$image_abs"
+    IMAGE_DIR=$(dirname -- "$IMAGE")
+    IMAGE_NAME=$(basename -- "$IMAGE")
+    STEM=$(image_stem_from_name "$IMAGE_NAME")
+    WORKDIR=$(workdir_for_image "$IMAGE")
+    FSDIR="$WORKDIR/fs"
+    BACKUP_DIR="$WORKDIR/backup"
+    META_DIR="$WORKDIR/meta"
+    OUT_DIR="$WORKDIR/out"
+    BUILD_DIR="$WORKDIR/build"
+    FAKEROOT_STATE="$META_DIR/fakeroot.state"
+    RUN_SH=""
+    if [[ -f "$IMAGE_DIR/run.sh" ]]; then
+        RUN_SH="$IMAGE_DIR/run.sh"
+    fi
+
+    read -r ARCHIVE_KIND COMPRESSION <<<"$(detect_archive "$IMAGE")"
+    case "$ARCHIVE_KIND" in
+        cpio|extfs)
+            ;;
+        *)
+            die "unsupported archive type: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+compression_suffix() {
+    case "$1" in
+        none) printf '' ;;
+        gzip) printf '.gz' ;;
+        xz) printf '.xz' ;;
+        zstd) printf '.zst' ;;
+        lz4) printf '.lz4' ;;
+        *) die "unknown compression: $1" ;;
+    esac
+}
+
+detect_archive() {
+    local image="$1"
+    local desc
+
+    desc=$(file -b -- "$image")
+    case "$desc" in
+        *cpio\ archive*)
+            printf 'cpio none\n'
+            ;;
+        *gzip\ compressed\ data*)
+            printf 'cpio gzip\n'
+            ;;
+        *XZ\ compressed\ data*)
+            printf 'cpio xz\n'
+            ;;
+        *Zstandard\ compressed\ data*)
+            printf 'cpio zstd\n'
+            ;;
+        *LZ4\ compressed\ data*)
+            printf 'cpio lz4\n'
+            ;;
+        *Squashfs\ filesystem*)
+            printf 'squashfs none\n'
+            ;;
+        *ext2\ filesystem*|*ext3\ filesystem*|*ext4\ filesystem*)
+            printf 'extfs none\n'
+            ;;
+        *)
+            printf 'unknown none\n'
+            ;;
+    esac
+}
+
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+require_cpio_tools() {
+    require_tool cpio
+    case "$COMPRESSION" in
+        gzip) require_tool gzip ;;
+        xz) require_tool xz ;;
+        zstd) require_tool zstd ;;
+        lz4) require_tool lz4 ;;
+    esac
+}
+
+require_open_tools() {
+    case "$ARCHIVE_KIND" in
+        cpio)
+            require_cpio_tools
+            ;;
+        extfs)
+            require_tool debugfs
+            ;;
+        *)
+            die "unsupported archive type for open: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+require_pack_tools() {
+    case "$ARCHIVE_KIND" in
+        cpio)
+            require_cpio_tools
+            ;;
+        extfs)
+            require_tool debugfs
+            require_tool dumpe2fs
+            require_tool mke2fs
+            require_tool tune2fs
+            ;;
+        *)
+            die "unsupported archive type for pack: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+ensure_context_dirs() {
+    mkdir -p "$BACKUP_DIR" "$META_DIR" "$OUT_DIR" "$BUILD_DIR"
+    : >"$FAKEROOT_STATE"
+}
+
+archive_cat() {
+    local image="$1"
+    local compression="$2"
+
+    case "$compression" in
+        none) cat -- "$image" ;;
+        gzip) gzip -dc -- "$image" ;;
+        xz) xz -dc -- "$image" ;;
+        zstd) zstd -dc -- "$image" ;;
+        lz4) lz4 -dc -- "$image" ;;
+        *) die "unsupported compression: $compression" ;;
+    esac
+}
+
+archive_write() {
+    local compression="$1"
+
+    case "$compression" in
+        none) cat ;;
+        gzip) gzip -c ;;
+        xz) xz -zc ;;
+        zstd) zstd -q -zc ;;
+        lz4) lz4 -q -zc ;;
+        *) die "unsupported compression: $compression" ;;
+    esac
+}
+
+unpack_archive_to_dir() {
+    local image="$1"
+    local compression="$2"
+    local dst="$3"
+
+    mkdir -p "$dst"
+    archive_cat "$image" "$compression" | (
+        cd "$dst"
+        cpio -idmu --quiet --no-absolute-filenames --no-preserve-owner
+    )
+}
+
+unpack_extfs_to_dir() {
+    local image="$1"
+    local dst="$2"
+
+    mkdir -p "$dst"
+    (
+        cd "$dst"
+        run_in_fakeroot "$FAKEROOT_STATE" debugfs -R 'rdump / .' "$image" >/dev/null
+    )
+}
+
+unpack_image_to_dir() {
+    local image="$1"
+    local dst="$2"
+
+    case "$ARCHIVE_KIND" in
+        cpio)
+            unpack_archive_to_dir "$image" "$COMPRESSION" "$dst"
+            ;;
+        extfs)
+            unpack_extfs_to_dir "$image" "$dst"
+            ;;
+        *)
+            die "unsupported archive type for unpack: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+run_in_fakeroot() {
+    local state_file="$1"
+    shift
+
+    if command -v fakeroot >/dev/null 2>&1; then
+        fakeroot -i "$state_file" -s "$state_file" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+write_state() {
+    local state_file="$1"
+
+    mkdir -p "$(dirname -- "$state_file")"
+    {
+        printf 'STATE_VERSION=%q\n' "1"
+        printf 'IMAGE=%q\n' "$IMAGE"
+        printf 'IMAGE_DIR=%q\n' "$IMAGE_DIR"
+        printf 'IMAGE_NAME=%q\n' "$IMAGE_NAME"
+        printf 'STEM=%q\n' "$STEM"
+        printf 'WORKDIR=%q\n' "$WORKDIR"
+        printf 'FSDIR=%q\n' "$FSDIR"
+        printf 'BACKUP_DIR=%q\n' "$BACKUP_DIR"
+        printf 'META_DIR=%q\n' "$META_DIR"
+        printf 'OUT_DIR=%q\n' "$OUT_DIR"
+        printf 'BUILD_DIR=%q\n' "$BUILD_DIR"
+        printf 'FAKEROOT_STATE=%q\n' "$FAKEROOT_STATE"
+        printf 'ARCHIVE_KIND=%q\n' "$ARCHIVE_KIND"
+        printf 'COMPRESSION=%q\n' "$COMPRESSION"
+        printf 'RUN_SH=%q\n' "$RUN_SH"
+    } >"$state_file"
+}
+
+load_state() {
+    local image_abs="$1"
+    local workdir state_file
+
+    workdir=$(workdir_for_image "$image_abs")
+    state_file=$(state_file_for_workdir "$workdir")
+    [[ -f "$state_file" ]] || die "workdir not initialized, run: $TOOL_NAME open $image_abs"
+
+    # shellcheck disable=SC1090
+    source "$state_file"
+    [[ "${STATE_VERSION:-}" == "1" ]] || die "unsupported state version: ${STATE_VERSION:-unknown}"
+}
+
+backup_init() {
+    local fsdir="$1"
+    local backup_dir="$2"
+
+    mkdir -p "$backup_dir"
+    if [[ -f "$fsdir/init" && ! -f "$backup_dir/init.orig" ]]; then
+        cp -a -- "$fsdir/init" "$backup_dir/init.orig"
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$fsdir/init" >"$backup_dir/init.orig.sha256"
+        fi
+        log "backed up /init -> $(basename -- "$backup_dir")/init.orig"
+    fi
+}
+
+restore_init() {
+    local fsdir="$1"
+    local backup_dir="$2"
+
+    [[ -f "$backup_dir/init.orig" ]] || die "no /init backup found"
+    cp -a -- "$backup_dir/init.orig" "$fsdir/init"
+    log "restored original /init"
+}
+
+build_exp() {
+    local src="$1"
+    local out="$2"
+    local cc="${CC:-gcc}"
+    local tmp
+    local -a cmd
+
+    require_tool "$cc"
+    mkdir -p "$BUILD_DIR"
+    tmp=$(mktemp "$BUILD_DIR/$(basename -- "$out").XXXXXX.tmp")
+
+    cmd=("$cc" "$src" -O2 -static -masm=intel)
+    if [[ -n "${EXTRA_CFLAGS:-}" ]]; then
+        # shellcheck disable=SC2206
+        local extra_flags=( ${EXTRA_CFLAGS} )
+        cmd+=("${extra_flags[@]}")
+    fi
+    cmd+=(-o "$tmp")
+
+    log "building $(basename -- "$out") from $(basename -- "$src")"
+    "${cmd[@]}"
+    chmod 755 "$tmp"
+    mv -f -- "$tmp" "$out"
+}
+
+pack_archive() {
+    local src_dir="$1"
+    local output="$2"
+    local tmp
+
+    mkdir -p "$OUT_DIR"
+    tmp="$output.tmp"
+    rm -f -- "$tmp"
+
+    (
+        cd "$src_dir"
+        find . -mindepth 1 -printf '%P\0' \
+            | LC_ALL=C sort -z \
+            | run_in_fakeroot "$FAKEROOT_STATE" cpio --null -o --format=newc --owner=0:0 --quiet
+    ) | archive_write "$COMPRESSION" >"$tmp"
+
+    mv -f -- "$tmp" "$output"
+}
+
+extfs_super_value() {
+    local header="$1"
+    local key="$2"
+
+    awk -F: -v key="$key" '
+        $1 == key {
+            sub(/^[[:space:]]+/, "", $2)
+            sub(/[[:space:]]+$/, "", $2)
+            print $2
+            exit
+        }
+    ' <<<"$header"
+}
+
+pack_extfs() {
+    local src_dir="$1"
+    local output="$2"
+    local header tmp fs_uuid block_size inode_size inode_count block_count reserved_blocks volume_name
+    local -a cmd
+
+    mkdir -p "$OUT_DIR"
+    tmp="$output.tmp"
+    rm -f -- "$tmp"
+
+    header=$(dumpe2fs -h "$IMAGE" 2>/dev/null) || die "failed to read extfs metadata from $IMAGE"
+    fs_uuid=$(extfs_super_value "$header" "Filesystem UUID")
+    block_size=$(extfs_super_value "$header" "Block size")
+    inode_size=$(extfs_super_value "$header" "Inode size")
+    inode_count=$(extfs_super_value "$header" "Inode count")
+    block_count=$(extfs_super_value "$header" "Block count")
+    reserved_blocks=$(extfs_super_value "$header" "Reserved block count")
+    volume_name=$(extfs_super_value "$header" "Filesystem volume name")
+
+    [[ -n "$block_size" && -n "$inode_size" && -n "$inode_count" && -n "$block_count" ]] \
+        || die "incomplete extfs metadata, cannot rebuild $IMAGE"
+
+    cmd=(mke2fs -q -F -t ext4 -d "$src_dir" -b "$block_size" -I "$inode_size" -N "$inode_count")
+    [[ -n "$fs_uuid" ]] && cmd+=(-U "$fs_uuid")
+    cmd+=("$tmp" "$block_count")
+
+    run_in_fakeroot "$FAKEROOT_STATE" "${cmd[@]}"
+
+    if [[ -n "$reserved_blocks" ]]; then
+        tune2fs -r "$reserved_blocks" "$tmp" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$volume_name" && "$volume_name" != "<none>" ]]; then
+        tune2fs -L "$volume_name" "$tmp" >/dev/null 2>&1 || true
+    fi
+
+    mv -f -- "$tmp" "$output"
+}
+
+pack_image() {
+    local src_dir="$1"
+    local output="$2"
+
+    case "$ARCHIVE_KIND" in
+        cpio)
+            pack_archive "$src_dir" "$output"
+            ;;
+        extfs)
+            pack_extfs "$src_dir" "$output"
+            ;;
+        *)
+            die "unsupported archive type for pack: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+output_extension() {
+    case "$ARCHIVE_KIND" in
+        cpio)
+            printf '.cpio%s\n' "$(compression_suffix "$COMPRESSION")"
+            ;;
+        extfs)
+            case "$IMAGE_NAME" in
+                *.ext4) printf '.ext4\n' ;;
+                *.ext3) printf '.ext3\n' ;;
+                *.ext2) printf '.ext2\n' ;;
+                *.img) printf '.img\n' ;;
+                *) printf '.img\n' ;;
+            esac
+            ;;
+        *)
+            die "unsupported archive type for output naming: $ARCHIVE_KIND"
+            ;;
+    esac
+}
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+escape_sed_pattern() {
+    printf '%s' "$1" | sed 's/[][\\/.*^$()+?{}|]/\\&/g'
+}
+
+strip_template_shebang() {
+    sed '1{/^#![[:graph:]]*/d;}'
+}
+
+generate_run_script() {
+    local output="$1"
+    local script_path="$2"
+    local rel_output image_dir_escaped
+    local escaped_output escaped_rel_output escaped_rel_name escaped_rel_input escaped_image_abs escaped_image_name
+
+    [[ -n "$RUN_SH" && -f "$RUN_SH" ]] || return 0
+
+    rel_output="${output#$IMAGE_DIR/}"
+    image_dir_escaped=$(printf '%s' "$IMAGE_DIR" | sed "s/'/'\\\\''/g")
+    escaped_output=$(escape_sed_replacement "$output")
+    escaped_rel_output=$(escape_sed_replacement "./$rel_output")
+    escaped_rel_name=$(escape_sed_replacement "$rel_output")
+    escaped_rel_input=$(escape_sed_pattern "./$IMAGE_NAME")
+    escaped_image_abs=$(escape_sed_pattern "$IMAGE")
+    escaped_image_name=$(escape_sed_pattern "$IMAGE_NAME")
+
+    if grep -Fq -- "$IMAGE_NAME" "$RUN_SH" || grep -Fq -- "$IMAGE" "$RUN_SH"; then
+        {
+            printf '#!/bin/sh\n'
+            printf "cd '%s'\n" "$image_dir_escaped"
+            strip_template_shebang <"$RUN_SH" \
+                | sed \
+                    -e "s#${escaped_image_abs}#${escaped_output}#g" \
+                    -e "s#${escaped_rel_input}#${escaped_rel_output}#g" \
+                    -e "s#${escaped_image_name}#${escaped_rel_name}#g"
+        } >"$script_path"
+    else
+        cat >"$script_path" <<EOF
+#!/bin/sh
+cd '$image_dir_escaped'
+exec "$RUN_SH" "\$@"
+EOF
+    fi
+    chmod +x "$script_path"
+    log "generated $(basename -- "$script_path")"
+}
+
+detect_ko_path() {
+    local ko_ref=""
+    local resolved=""
+
+    if [[ -n "$RUN_SH" && -f "$RUN_SH" ]]; then
+        ko_ref=$(sed -nE 's/.*-drive file=([^,[:space:]]+\.ko).*/\1/p' "$RUN_SH" | head -n1 || true)
+    fi
+
+    if [[ -n "$ko_ref" ]]; then
+        case "$ko_ref" in
+            /*)
+                resolved="$ko_ref"
+                ;;
+            ./*)
+                resolved="$IMAGE_DIR/${ko_ref#./}"
+                ;;
+            *)
+                resolved="$IMAGE_DIR/$ko_ref"
+                ;;
+        esac
+    fi
+
+    if [[ -n "$resolved" && -f "$resolved" ]]; then
+        printf '%s\n' "$resolved"
+        return
+    fi
+
+    resolved=$(find "$IMAGE_DIR" -maxdepth 1 -type f -name '*.ko' | sort | head -n1 || true)
+    if [[ -n "$resolved" && -f "$resolved" ]]; then
+        printf '%s\n' "$resolved"
+    fi
+}
+
+detect_module_name() {
+    local ko_path="$1"
+    local mod_name=""
+
+    if command -v modinfo >/dev/null 2>&1; then
+        mod_name=$(modinfo -F name "$ko_path" 2>/dev/null | head -n1 || true)
+    fi
+
+    if [[ -z "$mod_name" ]]; then
+        mod_name=$(readelf -p .modinfo "$ko_path" 2>/dev/null \
+            | sed -nE 's/.*name=([^[:space:]]+).*/\1/p' | head -n1 || true)
+    fi
+
+    if [[ -z "$mod_name" ]]; then
+        mod_name=$(basename -- "$ko_path")
+        mod_name=${mod_name%.ko}
+    fi
+
+    printf '%s\n' "$mod_name"
+}
+
+generate_gdb_cmd_file() {
+    local gdb_cmd_path="$1"
+    local vmlinux_path="$2"
+    local ko_path="$3"
+    local module_name="$4"
+    local vmlinux_escaped ko_escaped module_escaped
+
+    vmlinux_escaped=$(printf '%s' "$vmlinux_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    ko_escaped=$(printf '%s' "$ko_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    module_escaped=$(printf '%s' "$module_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    cat >"$gdb_cmd_path" <<EOF
+set pagination off
+set breakpoint pending on
+file $vmlinux_path
+target remote :${GDB_PORT}
+
+python
+import gdb
+import struct
+
+TARGET_MODULE = "$module_escaped"
+TARGET_KO = "$ko_escaped"
+MODULE_NAME_OFF = 0x18
+MODULE_TEXT_BASE_OFF = 0x140
+U64_MASK = (1 << 64) - 1
+
+def _u64(value):
+    return int(value) & U64_MASK
+
+def _read_cstring(addr, limit=64):
+    addr &= U64_MASK
+    data = gdb.selected_inferior().read_memory(addr, limit).tobytes()
+    return data.split(b"\\x00", 1)[0].decode("ascii", "ignore")
+
+def _read_u64(addr):
+    addr &= U64_MASK
+    data = gdb.selected_inferior().read_memory(addr, 8).tobytes()
+    return struct.unpack("<Q", data)[0]
+
+class AutoLoadModuleSymbols(gdb.Breakpoint):
+    def __init__(self):
+        super().__init__("*do_init_module", internal=False)
+
+    def stop(self):
+        try:
+            mod = _u64(gdb.parse_and_eval("\$rdi"))
+            name = _read_cstring(mod + MODULE_NAME_OFF)
+        except gdb.error:
+            return True
+        except gdb.MemoryError:
+            return True
+
+        if name != TARGET_MODULE:
+            return False
+
+        try:
+            text_base = _read_u64(mod + MODULE_TEXT_BASE_OFF)
+        except gdb.MemoryError:
+            return True
+
+        gdb.execute(f"set \$modbase = 0x{text_base:x}")
+        gdb.write(f"[rootfs-tool] {TARGET_MODULE}.ko text base = 0x{text_base:x}\\n")
+        gdb.execute(f'add-symbol-file "{TARGET_KO}" 0x{text_base:x}')
+        self.enabled = False
+        return False
+
+AutoLoadModuleSymbols()
+end
+
+hbreak *start_kernel
+echo [rootfs-tool] connected; continuing to start_kernel.\\n
+echo [rootfs-tool] after you continue, evil.ko symbols will auto-load at do_init_module.\\n
+continue
+EOF
+
+    chmod 644 "$gdb_cmd_path"
+    log "generated $(basename -- "$gdb_cmd_path")"
+}
+
+generate_gdb_assets() {
+    local gdb_cmd_path="$1"
+    local vmlinux_path ko_path module_name
+
+    vmlinux_path="$IMAGE_DIR/vmlinux"
+    if [[ ! -f "$vmlinux_path" ]]; then
+        log "skipping gdb helpers: no vmlinux in $IMAGE_DIR"
+        return 0
+    fi
+
+    ko_path=$(detect_ko_path || true)
+    if [[ -z "$ko_path" || ! -f "$ko_path" ]]; then
+        log "skipping gdb helpers: no .ko found in $IMAGE_DIR"
+        return 0
+    fi
+
+    module_name=$(detect_module_name "$ko_path")
+    generate_gdb_cmd_file "$gdb_cmd_path" "$vmlinux_path" "$ko_path" "$module_name"
+}
+
+cmd_open() {
+    local force=0
+    local image image_abs
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force)
+                force=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                die "unknown option for open: $1"
+                ;;
+            *)
+                image="$1"
+                shift
+                break
+                ;;
+        esac
+    done
+
+    [[ $# -eq 0 ]] || die "open takes exactly one IMAGE"
+    [[ -n "${image:-}" ]] || die "missing IMAGE"
+
+    image_abs=$(abs_existing_path "$image")
+    init_context_from_image "$image_abs"
+    require_open_tools
+
+    if [[ -e "$WORKDIR" ]]; then
+        if [[ "$force" -eq 1 ]]; then
+            rm -rf -- "$WORKDIR"
+        else
+            die "workdir already exists: $WORKDIR (use --force to recreate)"
+        fi
+    fi
+
+    mkdir -p "$FSDIR"
+    ensure_context_dirs
+    write_state "$(state_file_for_workdir "$WORKDIR")"
+
+    log "unpacking $IMAGE_NAME -> $WORKDIR"
+    unpack_image_to_dir "$IMAGE" "$FSDIR"
+
+    backup_init "$FSDIR" "$BACKUP_DIR"
+    log "ready: $WORKDIR"
+}
+
+cmd_pack() {
+    local image image_abs output_name output src="" restore_first=0 pristine=0
+    local pack_fs run_script temp_fs="" state_file have_state=0 gdb_cmd_path=""
+
+    [[ $# -ge 1 ]] || die "missing IMAGE"
+    image="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --restore-init)
+                restore_first=1
+                ;;
+            --pristine)
+                pristine=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -*)
+                die "unknown option for pack: $1"
+                ;;
+            *)
+                [[ -z "$src" ]] || die "too many positional args for pack"
+                src="$1"
+                ;;
+        esac
+        shift
+    done
+
+    image_abs=$(abs_existing_path "$image")
+    state_file=$(state_file_for_workdir "$(workdir_for_image "$image_abs")")
+    if [[ -f "$state_file" ]]; then
+        load_state "$image_abs"
+        have_state=1
+    else
+        init_context_from_image "$image_abs"
+        ensure_context_dirs
+    fi
+    require_pack_tools
+
+    if [[ "$restore_first" -eq 1 && "$pristine" -eq 1 ]]; then
+        die "--restore-init and --pristine cannot be used together"
+    fi
+
+    if [[ "$pristine" -eq 0 && "$have_state" -eq 0 ]]; then
+        die "workdir not initialized, run: $TOOL_NAME open $image_abs"
+    fi
+
+    if [[ "$restore_first" -eq 1 ]]; then
+        restore_init "$FSDIR" "$BACKUP_DIR"
+    fi
+
+    pack_fs="$FSDIR"
+    output_name="${STEM}.debug$(output_extension)"
+    run_script="$IMAGE_DIR/run.debug.sh"
+    gdb_cmd_path="$IMAGE_DIR/run.debug.gdb"
+
+    if [[ "$pristine" -eq 1 ]]; then
+        temp_fs=$(mktemp -d "$WORKDIR/pristine-pack.XXXXXX")
+        log "preparing pristine tree from $(basename -- "$IMAGE")"
+        unpack_image_to_dir "$IMAGE" "$temp_fs"
+        pack_fs="$temp_fs"
+        output_name="${STEM}.exp-only$(output_extension)"
+        run_script="$IMAGE_DIR/run.exp-only.sh"
+        gdb_cmd_path=""
+    fi
+
+    if [[ -n "$src" ]]; then
+        src=$(abs_existing_path "$src")
+    elif [[ -f "$IMAGE_DIR/exp.c" ]]; then
+        src="$IMAGE_DIR/exp.c"
+    fi
+
+    if [[ -n "$src" ]]; then
+        src=$(abs_existing_path "$src")
+        build_exp "$src" "$pack_fs/exp"
+    else
+        log "no exp source found, skipping build"
+    fi
+
+    output="$OUT_DIR/$output_name"
+
+    log "packing $(basename -- "$output")"
+    pack_image "$pack_fs" "$output"
+    generate_run_script "$output" "$run_script"
+    if [[ -n "$gdb_cmd_path" ]]; then
+        generate_gdb_assets "$gdb_cmd_path"
+    fi
+
+    if [[ -n "$temp_fs" && -d "$temp_fs" ]]; then
+        rm -rf -- "$temp_fs"
+    fi
+
+    printf '%s\n' "$output"
+}
+
+main() {
+    local cmd="${1:-}"
+    [[ -n "$cmd" ]] || {
+        usage
+        exit 1
+    }
+    shift || true
+
+    case "$cmd" in
+        open) cmd_open "$@" ;;
+        pack) cmd_pack "$@" ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            die "unknown command: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
