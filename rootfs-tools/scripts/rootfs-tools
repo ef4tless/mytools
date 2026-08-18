@@ -17,16 +17,17 @@ usage() {
     cat <<EOF
 Usage:
   $TOOL_NAME open [--force] IMAGE
-  $TOOL_NAME pack IMAGE [EXP_SRC] [--restore-init] [--pristine]
+  $TOOL_NAME pack IMAGE [EXP_SRC] [--use-exp EXP_BIN] [--restore-init] [--pristine]
 
 Main commands:
   open   detect and unpack IMAGE into IMAGE-derived workdir
-  pack   optionally build exp, optionally restore /init, then repack
+  pack   optionally build exp, optionally inject prebuilt exp, optionally restore /init, then repack
 
 Notes:
   - workdir is created next to IMAGE, e.g. rootfs.cpio -> rootfs.work/
   - supports cpio and {gz,xz,zst,lz4}+cpio, plus raw ext2/3/4 images
-  - pack auto-builds IMAGE directory's exp.c with default -O2 when it exists
+  - pack auto-builds IMAGE directory's exp.c with default musl-gcc static flags when it exists
+  - pack --use-exp EXP_BIN skips compilation and copies EXP_BIN to /exp
   - pack --pristine rebuilds from the original IMAGE and injects only exp
   - normal pack generates a .gdb helper when vmlinux and *.ko are present
 
@@ -34,6 +35,7 @@ Examples:
   $TOOL_NAME open rootfs.cpio
   $TOOL_NAME pack rootfs.cpio
   $TOOL_NAME pack rootfs.cpio exp1.c
+  $TOOL_NAME pack rootfs.cpio --use-exp ./exp
   $TOOL_NAME pack rootfs.cpio --restore-init
   $TOOL_NAME pack rootfs.cpio --pristine
 EOF
@@ -276,7 +278,10 @@ run_in_fakeroot() {
     local state_file="$1"
     shift
 
-    if command -v fakeroot >/dev/null 2>&1; then
+    # Homebrew fakeroot cannot preload its arm64 dylib into macOS arm64e
+    # system binaries. GNU cpio already receives --owner=0:0 below, so run
+    # tools directly on Darwin instead of emitting a misleading abort.
+    if [[ "$(uname -s)" != "Darwin" ]] && command -v fakeroot >/dev/null 2>&1; then
         fakeroot -i "$state_file" -s "$state_file" -- "$@"
     else
         "$@"
@@ -345,7 +350,7 @@ restore_init() {
 build_exp() {
     local src="$1"
     local out="$2"
-    local cc="${CC:-gcc}"
+    local cc="${CC:-musl-gcc}"
     local tmp
     local -a cmd
 
@@ -353,7 +358,7 @@ build_exp() {
     mkdir -p "$BUILD_DIR"
     tmp=$(mktemp "$BUILD_DIR/$(basename -- "$out").XXXXXX.tmp")
 
-    cmd=("$cc" "$src" -O2 -static -masm=intel)
+    cmd=("$cc" "$src" -static -lpthread -idirafter /usr/include/ -idirafter /usr/include/x86_64-linux-gnu/)
     if [[ -n "${EXTRA_CFLAGS:-}" ]]; then
         # shellcheck disable=SC2206
         local extra_flags=( ${EXTRA_CFLAGS} )
@@ -363,6 +368,21 @@ build_exp() {
 
     log "building $(basename -- "$out") from $(basename -- "$src")"
     "${cmd[@]}"
+    chmod 755 "$tmp"
+    mv -f -- "$tmp" "$out"
+}
+
+install_exp_binary() {
+    local src="$1"
+    local out="$2"
+    local tmp
+
+    [[ -f "$src" ]] || die "prebuilt exp is not a file: $src"
+    mkdir -p "$BUILD_DIR"
+    tmp=$(mktemp "$BUILD_DIR/$(basename -- "$out").XXXXXX.tmp")
+
+    log "installing prebuilt $(basename -- "$out") from $(basename -- "$src")"
+    cat "$src" >"$tmp"
     chmod 755 "$tmp"
     mv -f -- "$tmp" "$out"
 }
@@ -378,7 +398,8 @@ pack_archive() {
 
     (
         cd "$src_dir"
-        find . -mindepth 1 -printf '%P\0' \
+        # BSD find on macOS has no -printf; cpio accepts the leading ./ from -print0.
+        find . -mindepth 1 -print0 \
             | LC_ALL=C sort -z \
             | run_in_fakeroot "$FAKEROOT_STATE" cpio --null -o --format=newc --owner=0:0 --quiet
     ) | archive_write "$COMPRESSION" >"$tmp"
@@ -731,7 +752,7 @@ cmd_open() {
 }
 
 cmd_pack() {
-    local image image_abs output_name output src="" restore_first=0 pristine=0
+    local image image_abs output_name output src="" prebuilt_exp="" restore_first=0 pristine=0
     local pack_fs run_script temp_fs="" state_file have_state=0 gdb_cmd_path=""
 
     [[ $# -ge 1 ]] || die "missing IMAGE"
@@ -745,6 +766,12 @@ cmd_pack() {
                 ;;
             --pristine)
                 pristine=1
+                ;;
+            --use-exp)
+                shift
+                [[ $# -gt 0 ]] || die "--use-exp requires EXP_BIN"
+                [[ -z "$prebuilt_exp" ]] || die "--use-exp specified more than once"
+                prebuilt_exp="$1"
                 ;;
             -h|--help)
                 usage
@@ -775,6 +802,9 @@ cmd_pack() {
     if [[ "$restore_first" -eq 1 && "$pristine" -eq 1 ]]; then
         die "--restore-init and --pristine cannot be used together"
     fi
+    if [[ -n "$src" && -n "$prebuilt_exp" ]]; then
+        die "EXP_SRC and --use-exp cannot be used together"
+    fi
 
     if [[ "$pristine" -eq 0 && "$have_state" -eq 0 ]]; then
         die "workdir not initialized, run: $TOOL_NAME open $image_abs"
@@ -799,17 +829,22 @@ cmd_pack() {
         gdb_cmd_path=""
     fi
 
-    if [[ -n "$src" ]]; then
-        src=$(abs_existing_path "$src")
-    elif [[ -f "$IMAGE_DIR/exp.c" ]]; then
-        src="$IMAGE_DIR/exp.c"
-    fi
-
-    if [[ -n "$src" ]]; then
-        src=$(abs_existing_path "$src")
-        build_exp "$src" "$pack_fs/exp"
+    if [[ -n "$prebuilt_exp" ]]; then
+        prebuilt_exp=$(abs_existing_path "$prebuilt_exp")
+        install_exp_binary "$prebuilt_exp" "$pack_fs/exp"
     else
-        log "no exp source found, skipping build"
+        if [[ -n "$src" ]]; then
+            src=$(abs_existing_path "$src")
+        elif [[ -f "$IMAGE_DIR/exp.c" ]]; then
+            src="$IMAGE_DIR/exp.c"
+        fi
+
+        if [[ -n "$src" ]]; then
+            src=$(abs_existing_path "$src")
+            build_exp "$src" "$pack_fs/exp"
+        else
+            log "no exp source found, skipping build"
+        fi
     fi
 
     output="$OUT_DIR/$output_name"

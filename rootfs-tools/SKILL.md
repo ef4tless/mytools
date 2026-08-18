@@ -64,13 +64,19 @@ firmware-specific extraction path instead.
    "$TOOL" pack rootfs.img ./exp.c
    ```
 
-8. Restore the original `/init` before rebuilding when your edits touched boot flow.
+8. Skip compilation and inject a prebuilt `exp` directly when you already have one.
+
+   ```bash
+   "$TOOL" pack rootfs.img --use-exp ./exp
+   ```
+
+9. Restore the original `/init` before rebuilding when your edits touched boot flow.
 
    ```bash
    "$TOOL" pack rootfs.img --restore-init
    ```
 
-9. Rebuild from the pristine source tree and inject only the new `exp` when you want to avoid
+10. Rebuild from the pristine source tree and inject only the new `exp` when you want to avoid
    carrying other filesystem edits.
 
    ```bash
@@ -78,7 +84,9 @@ firmware-specific extraction path instead.
    ```
 
 If `exp.c` lives next to the original image, `pack` auto-builds it into `/exp` with default
-`-O2 -static -masm=intel`. Append extra flags with `EXTRA_CFLAGS=...` when needed.
+`musl-gcc -static -lpthread -idirafter /usr/include/ -idirafter /usr/include/x86_64-linux-gnu/`.
+Append extra flags with `EXTRA_CFLAGS=...` when needed. If you already have a compiled `exp`,
+use `--use-exp ./exp` to skip compilation and copy it directly into the filesystem.
 
 ## Outputs
 

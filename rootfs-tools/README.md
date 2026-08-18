@@ -14,5 +14,5 @@
 ## 内容
 
 - `SKILL.md` — 完整使用说明（CTF 场景下的解包 → 修改 → 重打包流程）
-- `scripts/rootfs-tools` — 核心脚本（851 行）
+- `scripts/rootfs-tools` — 核心脚本，支持 `pack IMAGE --use-exp ./exp` 跳过编译直接注入现成 exp
 - `agents/openai.yaml` — Agent 接口描述
